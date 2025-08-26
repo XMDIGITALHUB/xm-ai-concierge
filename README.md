@@ -1,5 +1,5 @@
 # xm-ai-concierge
-echo "# xm-ai-concierge" >> README.md
+
 git init
 git add README.md
 git commit -m "first commit"
