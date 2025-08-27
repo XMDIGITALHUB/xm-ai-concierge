@@ -30,8 +30,16 @@ You are the "[XM] AI Concierge", powered by the "[XM] AI Hub" from [XM] Digital 
 `;
 
 // -------- CORS ----------
-function setCORS(res) {
-  res.setHeader("Access-Control-Allow-Origin", ALLOWED_ORIGIN);
+const ORIGINS = [
+  process.env.ALLOWED_ORIGIN || '',
+  process.env.ALLOWED_ORIGIN_2 || ''
+].filter(Boolean);
+
+function setCORS(req, res) {
+  const o = req.headers.origin || '';
+  const allow = ORIGINS.length ? (ORIGINS.includes(o) ? o : ORIGINS[0]) : '*';
+  res.setHeader("Access-Control-Allow-Origin", allow || '*');
+  res.setHeader("Vary", "Origin");
   res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
   res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
 }
