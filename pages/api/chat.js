@@ -1,51 +1,52 @@
 // [XM] Digital Hub — Chat API (Next.js "pages" router)
-// Path: /pages/api/chat.js
-// Host on Vercel. Compatible with the WP widget I gave you (typing + streaming UI).
+// File: /pages/api/chat.js
+// Host on Vercel. Compatible with the WP widget/snippet we set up.
 
-// ====== Config via Environment Variables ======
+// -------- Environment Variables ----------
 // OPENAI_API_KEY     (required)
 // OPENAI_MODEL       (optional, default: gpt-4o-mini)
-// MAX_TURNS_FREE     (optional, default: 6)            // free Q&A per user/session before paywall
-// MAX_TOKENS_REPLY   (optional, default: 450)          // cap tokens per reply for cost control
-// HUBSPOT_TOKEN      (optional)                        // Private App token (crm write scopes)
-// LEAD_WEBHOOK_URL   (optional)                        // e.g., Zapier/Make/your endpoint
-// ALLOWED_ORIGIN     (optional)                        // e.g., https://xmdigitalhub.com (CORS hardening)
+// MAX_TURNS_FREE     (optional, default: 6)        // free Q&A per session before paywall
+// MAX_TOKENS_REPLY   (optional, default: 450)      // cap per reply (cost control)
+// HUBSPOT_TOKEN      (optional)                    // HubSpot Private App token (crm write scopes)
+// LEAD_WEBHOOK_URL   (optional)                    // Zapier/Make/your endpoint
+// ALLOWED_ORIGIN     (optional)                    // e.g. https://xmdigitalhub.com (CORS)
 
-const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
-const OPENAI_MODEL = process.env.OPENAI_MODEL || "gpt-4o-mini";
-const MAX_TURNS_FREE = Number(process.env.MAX_TURNS_FREE || 6);
+const OPENAI_API_KEY   = process.env.OPENAI_API_KEY;
+const OPENAI_MODEL     = process.env.OPENAI_MODEL || "gpt-4o-mini";
+const MAX_TURNS_FREE   = Number(process.env.MAX_TURNS_FREE || 6);
 const MAX_TOKENS_REPLY = Number(process.env.MAX_TOKENS_REPLY || 450);
-const HUBSPOT_TOKEN = process.env.HUBSPOT_TOKEN || "";
+const HUBSPOT_TOKEN    = process.env.HUBSPOT_TOKEN || "";
 const LEAD_WEBHOOK_URL = process.env.LEAD_WEBHOOK_URL || "";
-const ALLOWED_ORIGIN = process.env.ALLOWED_ORIGIN || "*"; // set your domain for stricter CORS
+const ALLOWED_ORIGIN   = process.env.ALLOWED_ORIGIN || "*";
 
-// ====== Brand-safe system prompt ======
+// -------- Brand-safe system prompt ----------
 const SYSTEM_PROMPT = `
 You are the "[XM] AI Concierge", powered by the "[XM] AI Hub" from [XM] Digital Hub.
-- Always keep the tokens "[XM] Digital Hub", "[XM] AI Concierge", and "[XM] AI Hub]" in English.
+- Keep the tokens "[XM] Digital Hub", "[XM] AI Concierge", and "[XM] AI Hub" in English.
 - Auto-detect the user's language and reply in that language.
-- Be concise, ROI-focused, and practical (3–6 sentences). Use bullets when helpful.
-- Prioritize high-impact next steps and name KPIs when relevant (CVR, CAC, ROAS, LTV, AOV, SQL rate).
-- Scope you can help with: CRO & A/B testing, Heatmaps & UX/UI, SEO, Paid Media, Analytics & Attribution, Email/CRM, Content/Social, Marketplaces/Merchandising, Governance/OKRs.
-- Keep email-first; never push phone calls. If the user requests a call, propose email follow-up instead.
+- Be concise, ROI-focused, and practical. Prefer bullets. Name KPIs (CVR, CAC, ROAS, LTV, AOV).
+- Scope: CRO & A/B testing, Heatmaps & UX/UI, SEO, Paid Media, Analytics/Attribution, Email/CRM, Content/Social, Marketplaces/Merchandising, Governance/OKRs.
+- Email-first; do not push phone calls. If asked for a call, propose email follow-up instead.
 `;
 
-// ====== CORS helpers ======
-function cors(res) {
+// -------- CORS ----------
+function setCORS(res) {
   res.setHeader("Access-Control-Allow-Origin", ALLOWED_ORIGIN);
-  res.setHeader("Access-Control-Allow-Methods", "POST, OPTIONS, GET");
+  res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
   res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
 }
 
+// -------- API Handler ----------
 export default async function handler(req, res) {
-  cors(res);
+  setCORS(res);
 
-  if (req.method === "OPTIONS") {
-    return res.status(200).end();
-  }
+  if (req.method === "OPTIONS") return res.status(200).end();
+
+  // Health check
   if (req.method === "GET") {
     return res.status(200).json({ ok: true, service: "[XM] AI Concierge" });
   }
+
   if (req.method !== "POST") {
     return res.status(405).json({ error: "Method not allowed" });
   }
@@ -59,85 +60,71 @@ export default async function handler(req, res) {
     const messages = Array.isArray(body?.messages) ? body.messages : [];
     const meta = body?.metadata || {};
 
-    // 1) Lead capture path (non-billable)
+    // ---------- Non-billable lead capture ----------
+    // (Triggered by widget when user submits website/email/consent or Enterprise form.)
     if (meta?.lead) {
-      await Promise.allSettled([
-        pushWebhook(meta.lead, meta),
-        pushHubSpot(meta.lead, meta),
-      ]);
+      await Promise.allSettled([pushWebhook(meta.lead, meta), pushHubSpot(meta.lead, meta)]);
       return res.status(200).json({ received: true });
     }
 
-    // 2) Paywall (skip if explicitly non-billable lead asks)
-    const nonBillable = !!meta?.nonBillable;
-    const isPaid = !!meta?.subscriber; // (future: validate via Stripe)
-    const userTurns = messages.filter((m) => m?.role === "user").length;
+    // ---------- Free-turn paywall ----------
+    const nonBillable = !!meta?.nonBillable; // lead capture shouldn't count
+    const isPaid = !!meta?.subscriber;       // (future: validate Stripe signature)
+    const userTurns = messages.filter(m => m?.role === "user").length;
 
     if (!nonBillable && !isPaid && userTurns >= MAX_TURNS_FREE) {
       return res.status(200).json({
         paywall: true,
         message:
           meta?.paywallMessage ||
-          "You’ve reached the free trial limit. Subscribe to continue.",
+          "You’ve reached the free trial limit. Subscribe to continue."
       });
     }
 
-    // 3) Normal OpenAI completion
+    // ---------- Call OpenAI ----------
     const payload = {
       model: OPENAI_MODEL,
       temperature: 0.3,
       max_tokens: MAX_TOKENS_REPLY,
-      messages: [{ role: "system", content: SYSTEM_PROMPT }, ...messages],
+      messages: [{ role: "system", content: SYSTEM_PROMPT }, ...messages]
     };
 
-    const ai = await fetch("https://api.openai.com/v1/chat/completions", {
+    const aiRes = await fetch("https://api.openai.com/v1/chat/completions", {
       method: "POST",
       headers: {
         Authorization: `Bearer ${OPENAI_API_KEY}`,
-        "Content-Type": "application/json",
+        "Content-Type": "application/json"
       },
-      body: JSON.stringify(payload),
+      body: JSON.stringify(payload)
     });
 
-    const data = await ai.json();
+    const data = await aiRes.json();
 
-    if (!ai.ok) {
-      // Surface OpenAI error cleanly to client
-      return res.status(500).json({
-        error: "OpenAI error",
-        detail: data?.error || data,
-      });
+    if (!aiRes.ok) {
+      return res.status(500).json({ error: "OpenAI error", detail: data?.error || data });
     }
 
     const text =
       data?.choices?.[0]?.message?.content?.trim() ||
       "I couldn’t craft a reply right now.";
 
-    // Shape aligned with the WP widget’s expectations
+    // Shape expected by the front-end widget (simple, non-streaming)
     return res.status(200).json({
       data: {
         output_text: text,
         output: [
-          {
-            role: "assistant",
-            content: [{ type: "output_text", text }],
-          },
-        ],
+          { role: "assistant", content: [{ type: "output_text", text }] }
+        ]
       },
-      usage: data?.usage || null,
+      usage: data?.usage || null
     });
   } catch (err) {
-    return res.status(500).json({
-      error: "Server error",
-      detail: String(err?.message || err),
-    });
+    return res.status(500).json({ error: "Server error", detail: String(err?.message || err) });
   }
 }
 
-// ====== Helpers ======
-
+// -------- Helpers ----------
 async function readJSON(req) {
-  // Works on Vercel / Next pages API
   const chunks = [];
   for await (const c of req) chunks.push(c);
   try {
@@ -157,12 +144,10 @@ async function pushWebhook(lead, meta) {
         vendor: "[XM] Digital Hub",
         intent: meta?.intent || "",
         enterprise: !!meta?.enterprise,
-        lead: sanitizeLead(lead),
-      }),
+        lead: sanitizeLead(lead)
+      })
     });
-  } catch {
-    // swallow silently; lead capture must never break chat
-  }
+  } catch { /* never block chat on webhook errors */ }
 }
 
 async function pushHubSpot(lead, meta) {
@@ -172,7 +157,7 @@ async function pushHubSpot(lead, meta) {
       method: "POST",
       headers: {
         Authorization: `Bearer ${HUBSPOT_TOKEN}`,
-        "Content-Type": "application/json",
+        "Content-Type": "application/json"
       },
       body: JSON.stringify({
         properties: {
@@ -187,30 +172,19 @@ async function pushHubSpot(lead, meta) {
           xm_page: lead.page || "",
           xm_interest_tier: lead.tier_interest || "",
           xm_consent: String(!!lead.consent),
-          xm_consent_ts: lead.ts || new Date().toISOString(),
-        },
-      }),
+          xm_consent_ts: lead.ts || new Date().toISOString()
+        }
+      })
     });
-  } catch {
-    // swallow silently; lead capture must never break chat
-  }
+  } catch { /* never block chat on HubSpot errors */ }
 }
 
 function sanitizeLead(l = {}) {
-  const allowed = [
-    "name",
-    "email",
-    "website",
-    "company",
-    "company_size",
-    "budget",
-    "goal",
-    "consent",
-    "tier_interest",
-    "page",
-    "ts",
+  const allow = [
+    "name","email","website","company","company_size",
+    "budget","goal","consent","tier_interest","page","ts"
   ];
   const out = {};
-  for (const k of allowed) if (k in l) out[k] = l[k];
+  for (const k of allow) if (k in l) out[k] = l[k];
   return out;
 }
